@@ -1152,17 +1152,18 @@ def report_metrics(
     # Inverse pKd transform: Kd_nM = 1e9 * 10^(-pKd)
     preds_nM  = 1e9 * np.power(10.0, -preds_log.astype(np.float64))
     labels_nM = 1e9 * np.power(10.0, -labels_log.astype(np.float64))
-    mse_nM    = float(np.mean((preds_nM - labels_nM) ** 2))
+    # Report RMSE(nM) — sqrt of MSE so units are nM, not nM²
+    rmse_nM   = float(np.sqrt(np.mean((preds_nM - labels_nM) ** 2)))
 
     log.info(
         f"[{split_name}]  "
         f"MSE(pKd)   = {mse_log:.4f}  |  "
-        f"MSE(nM)    = {mse_nM:.1f}   |  "
+        f"RMSE(nM)   = {rmse_nM:.1f}  |  "
         f"CI         = {ci:.4f}"
     )
     return {
         "mse_pkd":    float(mse_log),
-        "mse_nM":     mse_nM,
+        "rmse_nM":    rmse_nM,
         "ci":         float(ci),
         "n_samples":  int(len(labels_log)),
     }
@@ -1517,16 +1518,16 @@ def main() -> None:
         if not _step_scheduler_each_batch:
             scheduler.step(val_mse_log)
 
-        # [LOW-7] MSE(nM) is for display only -- training loss is MSE(pKd)
+        # RMSE(nM) is for display only (in nM units) -- training loss is MSE(pKd)
         val_preds_nM  = 1e9 * np.power(10.0, -val_preds.astype(np.float64))
         val_labels_nM = 1e9 * np.power(10.0, -val_labels.astype(np.float64))
-        val_mse_nM    = float(np.mean((val_preds_nM - val_labels_nM) ** 2))
+        val_rmse_nM   = float(np.sqrt(np.mean((val_preds_nM - val_labels_nM) ** 2)))
         current_lr = optimizer.param_groups[0]["lr"]
         log.info(
             f"Epoch {epoch+1:3d}/{cfg.epochs}  |  "
             f"train MSE(pKd) {train_loss:.4f}  |  "
             f"val MSE(pKd) {val_mse_log:.4f}  |  "
-            f"val MSE(nM) {val_mse_nM:.1f}  |  "
+            f"val RMSE(nM) {val_rmse_nM:.1f}  |  "
             f"val CI {val_ci:.4f}  |  "
             f"lr {current_lr:.2e}  |  "
             f"{elapsed:.0f}s"
@@ -1536,7 +1537,7 @@ def main() -> None:
             epoch        = epoch + 1,
             train_mse    = train_loss,
             val_mse_pkd  = val_mse_log,
-            val_mse_nM   = val_mse_nM,
+            val_rmse_nM  = val_rmse_nM,
             val_ci       = val_ci,
             lr           = current_lr,
         ))
