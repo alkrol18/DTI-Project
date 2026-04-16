@@ -125,7 +125,7 @@ def build_parser() -> argparse.ArgumentParser:
                         "ignores warmup_ratio).")
     p.add_argument("--plateau_factor",  default=0.5,  type=float,
                    help="ReduceLROnPlateau multiplicative factor.")
-    p.add_argument("--plateau_patience",default=5,    type=int,
+    p.add_argument("--plateau_patience",default=15,   type=int,
                    help="ReduceLROnPlateau patience (epochs).")
     p.add_argument("--patience",        default=None, type=int,
                    help="Early-stopping patience in epochs (monitors val MSE). "
@@ -426,7 +426,7 @@ def cold_target_split(
 class DTIDataset(Dataset):
     """
     Tokenises (SMILES, protein-sequence) pairs.
-    Labels are log1p(Kd [nM]) -- DAVIS lower = tighter binding.
+    Labels are pKd = -log10(Kd [nM] / 1e9), range ~5-12 -- DAVIS lower Kd = tighter binding = higher pKd.
 
     Molecule (SMILES):
       Truncated at max_mol_len — safe because SMILES for small molecules
@@ -450,8 +450,10 @@ class DTIDataset(Dataset):
         self.mol_tok     = mol_tok
         self.prot_tok    = prot_tok
         self.max_mol_len = max_mol_len
-        self.labels      = torch.tensor(
-            np.log1p(df["Y"].values.astype(np.float32)), dtype=torch.float32
+        # pKd = -log10(Kd_nM / 1e9) = 9 - log10(Kd_nM); values ~5-12 for DAVIS
+        kd_nM = df["Y"].values.astype(np.float32)
+        self.labels = torch.tensor(
+            -np.log10(np.clip(kd_nM, 1e-9, None) / 1e9), dtype=torch.float32
         )
 
     def __len__(self) -> int:
@@ -815,6 +817,9 @@ class CrossModalDTI(nn.Module):
 
         log.info(f"Loading molecule encoder : {mol_model_name}")
         self.mol_encoder  = AutoModel.from_pretrained(mol_model_name,  cache_dir=cache_dir)
+        # NOTE: HuggingFace may warn that pooler.dense.{weight,bias} are randomly
+        # initialised.  This is expected — the pooler head is absent from MLM
+        # pre-training checkpoints and is not used in our forward pass.
 
         log.info(f"Loading protein  encoder : {prot_model_name}")
         _prot_backbone = AutoModel.from_pretrained(prot_model_name, cache_dir=cache_dir)
@@ -946,7 +951,33 @@ def load_checkpoint(
 ) -> Tuple[int, float, list]:
     log.info(f"Resuming from {path}")
     ckpt = torch.load(path, map_location="cpu")
-    model.load_state_dict(ckpt["model_state"])
+
+    missing_keys, unexpected_keys = model.load_state_dict(ckpt["model_state"], strict=False)
+
+    # Keys that are expected to be missing: randomly-initialised task-specific
+    # heads in the HuggingFace backbone (e.g. pooler.dense.*) that are absent
+    # from pre-training checkpoints and are not used in our forward pass.
+    _EXPECTED_MISSING_PATTERNS = ("pooler.dense",)
+    expected_missing   = [k for k in missing_keys
+                          if any(p in k for p in _EXPECTED_MISSING_PATTERNS)]
+    unexpected_missing = [k for k in missing_keys if k not in expected_missing]
+
+    if expected_missing:
+        log.info(
+            f"  Checkpoint missing keys (expected — task-specific heads not used "
+            f"in our forward pass, randomly initialised): {expected_missing}"
+        )
+    if unexpected_missing:
+        log.warning(
+            f"  Checkpoint UNEXPECTED missing keys (possible architecture mismatch "
+            f"— verify these layers exist in the current model): {unexpected_missing}"
+        )
+    if unexpected_keys:
+        log.warning(
+            f"  Checkpoint contains keys not present in current model "
+            f"(ignored): {unexpected_keys}"
+        )
+
     optimizer.load_state_dict(ckpt["optimizer_state"])
     if scheduler and "scheduler_state" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler_state"])
@@ -1078,7 +1109,7 @@ def evaluate(
     loader: DataLoader,
     device: torch.device,
 ) -> Tuple[float, np.ndarray, np.ndarray]:
-    """Returns (mse_log, predictions_log, labels_log) — all on log1p(Kd [nM]) scale."""
+    """Returns (mse_pkd, predictions_pkd, labels_pkd) — all on pKd = -log10(Kd/1e9) scale."""
     model.eval()
     total_loss, n = 0.0, 0
     all_preds, all_labels = [], []
@@ -1112,24 +1143,25 @@ def report_metrics(
     labels_log: np.ndarray,
 ) -> Dict:
     """
-    [LOW-7] Compute and log CI + MSE in both log1p scale (training objective)
-    and nanomolar scale (human-interpretable).  Returns a dict for JSON export.
+    [LOW-7] Compute and log CI + MSE in both pKd scale (training objective)
+    and nanomolar scale (human-interpretable).  MSE(nM) is for display only —
+    not used as a training signal.  Returns a dict for JSON export.
     """
     ci = concordance_index(labels_log, preds_log)
 
-    # Inverse log1p transform: expm1(x) = e^x - 1
-    preds_nM  = np.expm1(preds_log)
-    labels_nM = np.expm1(labels_log)
+    # Inverse pKd transform: Kd_nM = 1e9 * 10^(-pKd)
+    preds_nM  = 1e9 * np.power(10.0, -preds_log.astype(np.float64))
+    labels_nM = 1e9 * np.power(10.0, -labels_log.astype(np.float64))
     mse_nM    = float(np.mean((preds_nM - labels_nM) ** 2))
 
     log.info(
         f"[{split_name}]  "
-        f"MSE(log1p) = {mse_log:.4f}  |  "
+        f"MSE(pKd)   = {mse_log:.4f}  |  "
         f"MSE(nM)    = {mse_nM:.1f}   |  "
         f"CI         = {ci:.4f}"
     )
     return {
-        "mse_log1p":  float(mse_log),
+        "mse_pkd":    float(mse_log),
         "mse_nM":     mse_nM,
         "ci":         float(ci),
         "n_samples":  int(len(labels_log)),
@@ -1211,7 +1243,7 @@ def run_analysis(
     mse_log, preds_log, labels_log = evaluate(model, test_ldr, device)
     metrics = report_metrics("Cold-Target Test", mse_log, preds_log, labels_log)
     metrics["n_test_proteins"] = int(test_df["Target"].nunique())
-    metrics["label_scale"]     = "log1p(Kd [nM]) for training; nM for reporting"
+    metrics["label_scale"]     = "pKd = -log10(Kd/1e9) for training; nM for reporting"
     (out_dir / "cold_target_metrics.json").write_text(json.dumps(metrics, indent=2))
     log.info(f"  Metrics -> {out_dir}/cold_target_metrics.json")
 
@@ -1245,7 +1277,7 @@ def run_analysis(
                 "drug_smiles":            str(row["Drug"]),
                 "target_prefix":          str(row["Target"])[:30] + "...",
                 "true_kd_nM":             float(row["Y"]),
-                "true_kd_log1p":          float(np.log1p(row["Y"])),
+                "true_pkd":               float(-np.log10(max(row["Y"], 1e-9) / 1e9)),
                 "mol_saliency":           mol_sal[:mol_len].tolist(),
                 "prot_saliency":          prot_sal[:prot_len].tolist(),
                 "attn_map_shape":         [mol_len, prot_len],
@@ -1399,12 +1431,25 @@ def main() -> None:
         prot_stride     = cfg.prot_stride,
     ).to(device)
 
-    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    log.info(f"Trainable parameters : {n_params:,}")
+    # Freeze pre-trained encoders; only cross-attention layers and prediction
+    # head (including projection layers) accumulate gradients.
+    for param in model.mol_encoder.parameters():
+        param.requires_grad = False
+    for param in model.prot_encoder.encoder.parameters():
+        param.requires_grad = False
 
-    # Optimizer + scheduler
+    total_params     = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(
+        f"Parameters — total: {total_params:,}  |  "
+        f"trainable (non-frozen): {trainable_params:,}  |  "
+        f"frozen (encoders): {total_params - trainable_params:,}"
+    )
+
+    # Optimizer + scheduler — pass only trainable parameters
     optimizer   = torch.optim.AdamW(
-        model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay
+        filter(lambda p: p.requires_grad, model.parameters()),
+        lr=cfg.lr, weight_decay=cfg.weight_decay,
     )
     total_steps  = len(train_ldr) * cfg.epochs
     warmup_steps = int(total_steps * cfg.warmup_ratio)
@@ -1472,13 +1517,15 @@ def main() -> None:
         if not _step_scheduler_each_batch:
             scheduler.step(val_mse_log)
 
-        # [LOW-7] Report both log-scale (training objective) and nM (human-readable)
-        val_mse_nM = float(np.mean((np.expm1(val_preds) - np.expm1(val_labels)) ** 2))
+        # [LOW-7] MSE(nM) is for display only -- training loss is MSE(pKd)
+        val_preds_nM  = 1e9 * np.power(10.0, -val_preds.astype(np.float64))
+        val_labels_nM = 1e9 * np.power(10.0, -val_labels.astype(np.float64))
+        val_mse_nM    = float(np.mean((val_preds_nM - val_labels_nM) ** 2))
         current_lr = optimizer.param_groups[0]["lr"]
         log.info(
             f"Epoch {epoch+1:3d}/{cfg.epochs}  |  "
-            f"train MSE(log) {train_loss:.4f}  |  "
-            f"val MSE(log) {val_mse_log:.4f}  |  "
+            f"train MSE(pKd) {train_loss:.4f}  |  "
+            f"val MSE(pKd) {val_mse_log:.4f}  |  "
             f"val MSE(nM) {val_mse_nM:.1f}  |  "
             f"val CI {val_ci:.4f}  |  "
             f"lr {current_lr:.2e}  |  "
@@ -1488,7 +1535,7 @@ def main() -> None:
         history.append(dict(
             epoch        = epoch + 1,
             train_mse    = train_loss,
-            val_mse_log  = val_mse_log,
+            val_mse_pkd  = val_mse_log,
             val_mse_nM   = val_mse_nM,
             val_ci       = val_ci,
             lr           = current_lr,
