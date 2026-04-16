@@ -1,0 +1,28 @@
+# Core ML / Deep Learning
+torch>=2.0.0
+transformers>=4.36.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# Dataset
+PyTDC>=0.4.1
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MMseqs2  (binary — NOT pip-installable)
+# ─────────────────────────────────────────────────────────────────────────────
+# MMseqs2 is required for the primary cold-target split.  Without it the code
+# automatically falls back to Levenshtein clustering (slower, less rigorous).
+#
+# Install options:
+#
+#   Conda (recommended on HPC):
+#     conda install -c conda-forge -c bioconda mmseqs2
+#
+#   Pre-built binary (no conda):
+#     wget https://github.com/soedinglab/MMseqs2/releases/latest/download/mmseqs-linux-avx2.tar.gz
+#     tar -xzf mmseqs-linux-avx2.tar.gz
+#     export PATH="$PWD/mmseqs/bin:$PATH"   # add to ~/.bashrc or job.sh
+#
+#   Verify installation:
+#     mmseqs --version
+# ─────────────────────────────────────────────────────────────────────────────

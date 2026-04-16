@@ -1,0 +1,18 @@
+# Ignore model weights and datasets
+hf_cache/
+data/
+
+# Ignore outputs and model checkpoints
+outputs/
+checkpoint.pt
+*.pt
+*.pth
+
+# Ignore tool-specific metadata
+.claude/
+.claude.json
+.credentials.json
+history.jsonl
+stats-cache.json
+settings.json
+settings.local.json
