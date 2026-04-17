@@ -58,6 +58,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import DataLoader, Dataset
+from peft import LoraConfig, get_peft_model
+from rdkit import Chem
+from torch_geometric.data import Batch, Data
+from torch_geometric.nn import GCNConv, global_mean_pool
 from transformers import AutoModel, AutoTokenizer, get_cosine_schedule_with_warmup
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +143,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resume",          action="store_true", default=False)
     p.add_argument("--run_analysis",    action="store_true", default=False)
     p.add_argument("--saliency_n",      default=20,   type=int)
+    # GCN
+    p.add_argument("--use_gcn",          default=True, action=argparse.BooleanOptionalAction,
+                   help="Enable GCN drug encoder with gated fusion (--no-use_gcn to disable).")
+    # LoRA
+    p.add_argument("--lora_rank",        default=8,    type=int,
+                   help="LoRA rank r applied to Q/K/V in both encoders.")
+    p.add_argument("--lora_alpha",       default=16,   type=int,
+                   help="LoRA alpha (scaling = alpha / rank).")
     # [MED-6] top-K attention filter
     p.add_argument("--attn_topk",       default=None, type=int,
                    help="If set, use only the top-K molecule body tokens "
@@ -421,6 +433,80 @@ def cold_target_split(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# GCN Drug Encoder
+# ─────────────────────────────────────────────────────────────────────────────
+_ATOM_FEATURE_DIM = 4   # atomic_num_norm, degree_norm, formal_charge_norm, is_aromatic
+
+
+def smiles_to_graph(smiles: str) -> Data:
+    """
+    Convert a SMILES string to a PyG Data object.
+
+    Node features (per atom, 4-dim float32):
+      [atomic_num / 118,  degree / 10,  (formal_charge + 5) / 10,  is_aromatic]
+
+    Edges: one directed pair (i→j, j→i) per covalent bond (no edge features).
+    Falls back to a single-carbon graph for unparseable SMILES.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        log.warning(f"RDKit could not parse SMILES '{smiles[:40]}'; using fallback (C).")
+        mol = Chem.MolFromSmiles("C")
+
+    feats = []
+    for atom in mol.GetAtoms():
+        feats.append([
+            atom.GetAtomicNum()   / 118.0,
+            atom.GetDegree()      / 10.0,
+            (atom.GetFormalCharge() + 5) / 10.0,
+            float(atom.GetIsAromatic()),
+        ])
+    x = torch.tensor(feats, dtype=torch.float)
+
+    edges = []
+    for bond in mol.GetBonds():
+        i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
+        edges += [[i, j], [j, i]]
+    if edges:
+        edge_index = torch.tensor(edges, dtype=torch.long).t().contiguous()
+    else:
+        edge_index = torch.zeros((2, 0), dtype=torch.long)
+
+    return Data(x=x, edge_index=edge_index)
+
+
+class MolGCN(nn.Module):
+    """
+    3-layer GCN drug encoder.
+
+    Input  : atom feature matrix (N_atoms, 4) + edge_index + batch vector
+    Output : graph-level embedding (B, d_model) via global mean-pool
+
+    All layers are fully trainable (not frozen, not LoRA-adapted).
+    """
+
+    def __init__(self, d_model: int, dropout: float = 0.1) -> None:
+        super().__init__()
+        self.convs = nn.ModuleList([
+            GCNConv(_ATOM_FEATURE_DIM, d_model),
+            GCNConv(d_model,           d_model),
+            GCNConv(d_model,           d_model),
+        ])
+        self.norms = nn.ModuleList([nn.LayerNorm(d_model) for _ in range(3)])
+        self.drop  = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        x:          torch.Tensor,   # (N_total_atoms, 4)
+        edge_index: torch.Tensor,   # (2, E_total)
+        batch:      torch.Tensor,   # (N_total_atoms,) graph membership
+    ) -> torch.Tensor:              # (B, d_model)
+        for conv, norm in zip(self.convs, self.norms):
+            x = self.drop(norm(F.relu(conv(x, edge_index))))
+        return global_mean_pool(x, batch)   # (B, d_model)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Dataset  [CRIT-2: protein tokenised without truncation]
 # ─────────────────────────────────────────────────────────────────────────────
 class DTIDataset(Dataset):
@@ -444,17 +530,30 @@ class DTIDataset(Dataset):
         df:          pd.DataFrame,
         mol_tok:     AutoTokenizer,
         prot_tok:    AutoTokenizer,
-        max_mol_len: int = 128,
+        max_mol_len: int  = 128,
+        use_gcn:     bool = False,
     ) -> None:
         self.df          = df.reset_index(drop=True)
         self.mol_tok     = mol_tok
         self.prot_tok    = prot_tok
         self.max_mol_len = max_mol_len
+        self.use_gcn     = use_gcn
         # pKd = -log10(Kd_nM / 1e9) = 9 - log10(Kd_nM); values ~5-12 for DAVIS
         kd_nM = df["Y"].values.astype(np.float32)
         self.labels = torch.tensor(
             -np.log10(np.clip(kd_nM, 1e-9, None) / 1e9), dtype=torch.float32
         )
+        # Pre-compute molecular graphs, caching by unique SMILES to avoid
+        # redundant RDKit calls for drugs that appear in many pairs.
+        if use_gcn:
+            _cache: Dict[str, Data] = {}
+            self.mol_graphs: List[Data] = []
+            for smi in df["Drug"].astype(str):
+                if smi not in _cache:
+                    _cache[smi] = smiles_to_graph(smi)
+                self.mol_graphs.append(_cache[smi])
+            log.info(f"DTIDataset: pre-computed {len(_cache)} unique molecular graphs "
+                     f"for {len(df)} pairs.")
 
     def __len__(self) -> int:
         return len(self.df)
@@ -478,13 +577,16 @@ class DTIDataset(Dataset):
             return_tensors="pt",
         )
 
-        return {
+        item = {
             "mol_input_ids":       mol_enc["input_ids"].squeeze(0),
             "mol_attention_mask":  mol_enc["attention_mask"].squeeze(0),
             "prot_input_ids":      prot_enc["input_ids"].squeeze(0),      # variable length
             "prot_attention_mask": prot_enc["attention_mask"].squeeze(0),
             "label":               self.labels[idx],
         }
+        if self.use_gcn:
+            item["mol_graph"] = self.mol_graphs[idx]
+        return item
 
 
 def dti_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tensor]:
@@ -513,13 +615,22 @@ def dti_collate_fn(batch: List[Dict[str, torch.Tensor]]) -> Dict[str, torch.Tens
         prot_input_ids[i, :L]      = b["prot_input_ids"]
         prot_attention_mask[i, :L] = b["prot_attention_mask"]
 
-    return {
+    out = {
         "mol_input_ids":       mol_input_ids,
         "mol_attention_mask":  mol_attention_mask,
         "prot_input_ids":      prot_input_ids,
         "prot_attention_mask": prot_attention_mask,
         "label":               labels,
     }
+
+    # Molecular graphs (optional — only when use_gcn=True in DTIDataset)
+    if "mol_graph" in batch[0]:
+        graph_batch = Batch.from_data_list([b["mol_graph"] for b in batch])
+        out["gcn_x"]          = graph_batch.x
+        out["gcn_edge_index"] = graph_batch.edge_index
+        out["gcn_batch"]      = graph_batch.batch
+
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -812,6 +923,7 @@ class CrossModalDTI(nn.Module):
         cache_dir:       str   = "./hf_cache",
         prot_chunk_size: int   = 1020,
         prot_stride:     int   = 512,
+        use_gcn:         bool  = True,
     ) -> None:
         super().__init__()
 
@@ -851,6 +963,13 @@ class CrossModalDTI(nn.Module):
             nn.Linear(d_model // 2, 1),
         )
 
+        # GCN drug encoder + scalar gate for fusing with ChemBERTa
+        self.use_gcn = use_gcn
+        if use_gcn:
+            self.mol_gcn  = MolGCN(d_model, dropout)
+            # Scalar gate: sigmoid(W [mol_pool || gcn_pool]) ∈ (0,1) per sample
+            self.mol_gate = nn.Linear(d_model * 2, 1)
+
     def _encode(
         self,
         mol_ids:   torch.Tensor, mol_mask:  torch.Tensor,
@@ -871,6 +990,9 @@ class CrossModalDTI(nn.Module):
         mol_attention_mask:  torch.Tensor,
         prot_input_ids:      torch.Tensor,
         prot_attention_mask: torch.Tensor,
+        gcn_x:               Optional[torch.Tensor] = None,  # (N_atoms_total, 4)
+        gcn_edge_index:      Optional[torch.Tensor] = None,  # (2, E_total)
+        gcn_batch:           Optional[torch.Tensor] = None,  # (N_atoms_total,)
         return_attentions:   bool = False,
     ) -> Dict[str, torch.Tensor]:
 
@@ -897,6 +1019,12 @@ class CrossModalDTI(nn.Module):
         # Previously CLS token (position 0) — now consistent with molecule branch.
         prot_mask_f = prot_attention_mask.unsqueeze(-1).float()
         prot_pool   = (prot_h * prot_mask_f).sum(1) / prot_mask_f.sum(1).clamp(min=1e-9)
+
+        # GCN gated fusion: learned scalar gate blends graph and sequence embeddings
+        if self.use_gcn and gcn_x is not None:
+            gcn_pool = self.mol_gcn(gcn_x, gcn_edge_index, gcn_batch)  # (B, d_model)
+            gate     = torch.sigmoid(self.mol_gate(torch.cat([mol_pool, gcn_pool], dim=-1)))
+            mol_pool = gate * gcn_pool + (1.0 - gate) * mol_pool
 
         pred = self.predictor(torch.cat([mol_pool, prot_pool], dim=-1)).squeeze(-1)
 
@@ -1047,6 +1175,19 @@ def compute_saliency(
         prot_mask_f = prot_mask.unsqueeze(-1).float()
         prot_pool   = (prot_h * prot_mask_f).sum(1) / prot_mask_f.sum(1).clamp(min=1e-9)
 
+        # Apply GCN gate if available so the predictor sees the same fused
+        # mol_pool it was trained on.  GCN operates on discrete graph structure
+        # so its output is detached — gradients flow only through the BERT path.
+        if model.use_gcn and "gcn_x" in batch:
+            with torch.no_grad():
+                gcn_pool = model.mol_gcn(
+                    batch["gcn_x"].to(device),
+                    batch["gcn_edge_index"].to(device),
+                    batch["gcn_batch"].to(device),
+                )
+            gate     = torch.sigmoid(model.mol_gate(torch.cat([mol_pool, gcn_pool], dim=-1)))
+            mol_pool = gate * gcn_pool + (1.0 - gate) * mol_pool
+
         pred = model.predictor(torch.cat([mol_pool, prot_pool], dim=-1)).squeeze(-1)
         pred.sum().backward()
 
@@ -1078,10 +1219,14 @@ def train_one_epoch(
         prot_ids  = batch["prot_input_ids"].to(device)
         prot_mask = batch["prot_attention_mask"].to(device)
         labels    = batch["label"].to(device)
+        gcn_x          = batch["gcn_x"].to(device)          if "gcn_x"          in batch else None
+        gcn_edge_index = batch["gcn_edge_index"].to(device) if "gcn_edge_index" in batch else None
+        gcn_batch_t    = batch["gcn_batch"].to(device)      if "gcn_batch"      in batch else None
 
         optimizer.zero_grad()
         with autocast(enabled=(scaler is not None)):
-            out  = model(mol_ids, mol_mask, prot_ids, prot_mask)
+            out  = model(mol_ids, mol_mask, prot_ids, prot_mask,
+                         gcn_x, gcn_edge_index, gcn_batch_t)
             loss = F.mse_loss(out["prediction"], labels)
 
         if scaler is not None:
@@ -1120,8 +1265,12 @@ def evaluate(
         prot_ids  = batch["prot_input_ids"].to(device)
         prot_mask = batch["prot_attention_mask"].to(device)
         labels    = batch["label"].to(device)
+        gcn_x          = batch["gcn_x"].to(device)          if "gcn_x"          in batch else None
+        gcn_edge_index = batch["gcn_edge_index"].to(device) if "gcn_edge_index" in batch else None
+        gcn_batch_t    = batch["gcn_batch"].to(device)      if "gcn_batch"      in batch else None
 
-        out  = model(mol_ids, mol_mask, prot_ids, prot_mask)
+        out  = model(mol_ids, mol_mask, prot_ids, prot_mask,
+                     gcn_x, gcn_edge_index, gcn_batch_t)
         loss = F.mse_loss(out["prediction"], labels)
 
         total_loss  += loss.item() * labels.size(0)
@@ -1259,9 +1408,15 @@ def run_analysis(
     for idx in indices:
         row    = test_df.iloc[int(idx)]
         single = test_df.iloc[[int(idx)]].reset_index(drop=True)
-        ds     = DTIDataset(single, mol_tok, prot_tok, cfg.max_mol_len)
+        ds     = DTIDataset(single, mol_tok, prot_tok, cfg.max_mol_len,
+                            use_gcn=model.use_gcn)
         item   = ds[0]
         batch  = {k: v.unsqueeze(0) for k, v in item.items() if isinstance(v, torch.Tensor)}
+        if "mol_graph" in item:
+            g = Batch.from_data_list([item["mol_graph"]])
+            batch["gcn_x"]          = g.x
+            batch["gcn_edge_index"] = g.edge_index
+            batch["gcn_batch"]      = g.batch
 
         try:
             mol_sal, prot_sal, attn_map = compute_saliency(model, batch, device)
@@ -1406,7 +1561,7 @@ def main() -> None:
 
     # DataLoaders  [CRIT-2: dti_collate_fn for dynamic protein padding]
     def make_ldr(df_: pd.DataFrame, shuffle: bool) -> DataLoader:
-        ds = DTIDataset(df_, mol_tok, prot_tok, cfg.max_mol_len)
+        ds = DTIDataset(df_, mol_tok, prot_tok, cfg.max_mol_len, use_gcn=cfg.use_gcn)
         return DataLoader(
             ds,
             batch_size=cfg.batch_size,
@@ -1430,21 +1585,32 @@ def main() -> None:
         cache_dir       = cfg.cache_dir,
         prot_chunk_size = cfg.prot_chunk_size,
         prot_stride     = cfg.prot_stride,
+        use_gcn         = cfg.use_gcn,
     ).to(device)
 
-    # Freeze pre-trained encoders; only cross-attention layers and prediction
-    # head (including projection layers) accumulate gradients.
-    for param in model.mol_encoder.parameters():
-        param.requires_grad = False
-    for param in model.prot_encoder.encoder.parameters():
-        param.requires_grad = False
+    # Apply LoRA to Q/K/V projections in both encoders.
+    # get_peft_model freezes all base encoder weights and marks only the
+    # injected LoRA A/B matrices as trainable.  The projection layers,
+    # cross-attention layers, and predictor head are outside the peft wrapper
+    # and remain fully trainable.
+    _lora_cfg = LoraConfig(
+        r             = cfg.lora_rank,
+        lora_alpha    = cfg.lora_alpha,
+        target_modules= ["query", "key", "value"],
+        lora_dropout  = 0.0,
+        bias          = "none",
+    )
+    model.mol_encoder           = get_peft_model(model.mol_encoder,          _lora_cfg)
+    model.prot_encoder.encoder  = get_peft_model(model.prot_encoder.encoder, _lora_cfg)
 
     total_params     = sum(p.numel() for p in model.parameters())
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(
-        f"Parameters — total: {total_params:,}  |  "
-        f"trainable (non-frozen): {trainable_params:,}  |  "
-        f"frozen (encoders): {total_params - trainable_params:,}"
+        f"Parameters (LoRA r={cfg.lora_rank} α={cfg.lora_alpha}, "
+        f"GCN={'on' if cfg.use_gcn else 'off'}) — "
+        f"total: {total_params:,}  |  "
+        f"trainable: {trainable_params:,}  |  "
+        f"frozen: {total_params - trainable_params:,}"
     )
 
     # Optimizer + scheduler — pass only trainable parameters
