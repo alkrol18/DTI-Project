@@ -21,7 +21,7 @@ Predicts binding affinity (Kd) between small molecules and protein targets using
 **Fine-tuning**: LoRA (rank 8, α 16) applied to Q/K/V projections in both encoders; all other task-specific layers are fully trainable.  
 **Prediction**: Mean-pooled molecule and protein embeddings concatenated and passed through a 3-layer MLP predicting pKd = −log₁₀(Kd [nM] / 10⁹).
 
-## Results
+## Checkpoint Results
 
 Early checkpoint (2 epochs, random 80/10/10 split):
 
