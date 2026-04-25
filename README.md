@@ -30,7 +30,7 @@ Early checkpoint (2 epochs, random 80/10/10 split):
 | Validation | 2.570 | 0.731 |
 | Test | 2.964 | 0.695 |
 
-Full training runs 41 epochs (~8 h on an RTX 2080 Ti / A100).
+Full training runs 41 epochs (~8 h on an RTX 2080 Ti).
 
 ## Requirements
 
