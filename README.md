@@ -88,12 +88,10 @@ python dti_cross_modal.py --resume
 ### SLURM (HPC)
 
 ```bash
-sbatch job.sh
+sbatch run_dti.sh
 ```
 
-The job script targets `gpu-common` (1 GPU, 4 CPUs, 32 GB, 24 h wall time). It auto-detects an existing checkpoint and passes `--resume`. A SIGUSR1 signal sent 90 s before wall-time triggers a clean checkpoint save and exit for `--requeue`.
-
-To use the scavenger partition instead, comment/uncomment the relevant lines in `job.sh`.
+The job script targets `compsci-gpu` (1x A5000, 4 CPUs, 48 GB, 10 h wall time). Pass `--resume` to continue from an existing checkpoint.
 
 ### Binding-site validation
 
