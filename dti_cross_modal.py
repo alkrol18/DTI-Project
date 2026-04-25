@@ -3,9 +3,9 @@
 Cross-Modal Transformer for Drug-Target Interaction (DTI)
 =========================================================
 Dataset  : DAVIS (PyTDC)
-Split    : Cold-Target via MMseqs2 sequence clustering (Levenshtein fallback)
+Split    : Random (80/10/10) [default] or Cold-Target via MMseqs2 / Levenshtein
 Molecule : seyonec/ChemBERTa-zinc-base-v1
-Protein  : facebook/esm2_t6_8M_UR50D  (sliding-window encoder for long seqs)
+Protein  : facebook/esm2_t12_35M_UR50D  (sliding-window encoder for long seqs)
 Bridge   : L22 (Cross-Modal Attention) <-> L23 (Graph/Structural intuition)
            cross-attention weights act as proxy for physical binding-site residues
 
@@ -88,33 +88,47 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--cache_dir",       default="./hf_cache")
     p.add_argument("--output_dir",      default="./outputs")
     p.add_argument("--checkpoint_path", default="./checkpoint.pt")
-    # split  [CRIT-1]
+    # split
+    p.add_argument("--split_method",    default="random",
+                   choices=["random", "cold_target"],
+                   help="random = 80/10/10 row-level random split (default, "
+                        "gives ~5K val pairs); cold_target = MMseqs2 "
+                        "sequence-clustering split (Levenshtein fallback).")
     p.add_argument("--seq_id_threshold", default=0.30, type=float,
                    help="MMseqs2 sequence-identity threshold for cold-target "
                         "clustering (0.30 = 30%%).  Levenshtein fallback uses "
                         "1 - seq_id_threshold as the similarity floor.")
-    p.add_argument("--val_frac",        default=0.10, type=float)
-    p.add_argument("--test_frac",       default=0.20, type=float)
+    p.add_argument("--val_frac",        default=0.10, type=float,
+                   help="Validation fraction (used by cold_target split; "
+                        "random split always uses 0.10).")
+    p.add_argument("--test_frac",       default=0.20, type=float,
+                   help="Test fraction (used by cold_target split; "
+                        "random split always uses 0.10).")
     # model
     p.add_argument("--mol_model",       default="seyonec/ChemBERTa-zinc-base-v1")
-    p.add_argument("--prot_model",      default="facebook/esm2_t6_8M_UR50D")
+    p.add_argument("--esm_model",       default="facebook/esm2_t12_35M_UR50D",
+                   help="HuggingFace model ID for the ESM-2 protein encoder. "
+                        "Default is the 35M-parameter model.")
     p.add_argument("--d_model",         default=256,  type=int)
     p.add_argument("--n_heads",         default=8,    type=int)
     p.add_argument("--n_cross_layers",  default=2,    type=int)
-    p.add_argument("--dropout",         default=0.10, type=float)
+    p.add_argument("--dropout",         default=0.20, type=float)
     p.add_argument("--max_mol_len",     default=128,  type=int,
                    help="SMILES token budget (hard truncation is safe; "
                         "SMILES rarely exceed 100 tokens).")
     # [CRIT-2] prot_chunk_size replaces max_prot_len as the per-window limit
     p.add_argument("--prot_chunk_size", default=1020, type=int,
                    help="Max residue tokens per ESM-2 forward pass "
-                        "(ESM-2 t6_8M supports up to 1022 incl. BOS/EOS; "
+                        "(ESM-2 t12_35M supports up to 1022 incl. BOS/EOS; "
                         "1020 leaves 2 slots for special tokens).")
     p.add_argument("--prot_stride",     default=512,  type=int,
                    help="Sliding-window stride for proteins longer than "
                         "prot_chunk_size.  Overlap = chunk_size - stride.")
     # training
-    p.add_argument("--epochs",          default=50,   type=int)
+    p.add_argument("--epochs",          default=41,   type=int,
+                   help="Number of training epochs. The 35M ESM-2 "
+                        "(esm2_t12_35M_UR50D) takes approximately 700s per "
+                        "epoch on an RTX 2080 Ti; default of 41 fills ~8 h.")
     p.add_argument("--batch_size",      default=16,   type=int)
     p.add_argument("--lr",              default=1e-4, type=float)
     p.add_argument("--weight_decay",    default=1e-4, type=float)
@@ -430,6 +444,34 @@ def cold_target_split(
             val_frac=val_frac, test_frac=test_frac,
             seed=seed, cache_dir=cache_dir,
         )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Random Split (80 / 10 / 10)
+# ─────────────────────────────────────────────────────────────────────────────
+def random_split(
+    df:   pd.DataFrame,
+    seed: int = 42,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    Row-level random 80/10/10 train/val/test split.
+
+    Gives ~5 K validation pairs on DAVIS versus the ~884 pairs produced by
+    the cold-target clustering split, resulting in a much less noisy val MSE
+    signal during training.
+    """
+    rng = np.random.default_rng(seed)
+    idx = rng.permutation(len(df))
+    n_test = max(1, int(len(df) * 0.10))
+    n_val  = max(1, int(len(df) * 0.10))
+    test_df  = df.iloc[idx[:n_test]].reset_index(drop=True)
+    val_df   = df.iloc[idx[n_test : n_test + n_val]].reset_index(drop=True)
+    train_df = df.iloc[idx[n_test + n_val:]].reset_index(drop=True)
+    log.info(
+        f"Random split (80/10/10) — "
+        f"train: {len(train_df)}, val: {len(val_df)}, test: {len(test_df)}"
+    )
+    return train_df, val_df, test_df
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -943,7 +985,7 @@ class CrossModalDTI(nn.Module):
         )
 
         mol_dim  = self.mol_encoder.config.hidden_size    # ChemBERTa -> 768
-        prot_dim = self.prot_encoder.config.hidden_size   # ESM-2 t6  -> 320
+        prot_dim = self.prot_encoder.config.hidden_size   # ESM-2 t12_35M -> 480
 
         self.mol_proj = nn.Sequential(
             nn.Linear(mol_dim,  d_model), nn.LayerNorm(d_model), nn.Dropout(dropout)
@@ -956,6 +998,7 @@ class CrossModalDTI(nn.Module):
             CrossAttentionLayer(d_model, n_heads, dropout)
             for _ in range(n_cross_layers)
         ])
+        self.cross_dropout = nn.Dropout(dropout)
 
         self.predictor = nn.Sequential(
             nn.Linear(d_model * 2, d_model), nn.GELU(), nn.Dropout(dropout),
@@ -1007,6 +1050,7 @@ class CrossModalDTI(nn.Module):
         all_attn: List[torch.Tensor] = []
         for layer in self.cross_layers:
             mol_h, attn_w = layer(mol_h, prot_h, key_mask)
+            mol_h = self.cross_dropout(mol_h)
             if return_attentions:
                 all_attn.append(attn_w)          # (B, H, L_mol, L_prot)
 
@@ -1544,20 +1588,24 @@ def main() -> None:
     df    = davis.get_data()
     log.info(f"Total pairs : {len(df)}  columns : {df.columns.tolist()}")
 
-    # Cold-target split  [CRIT-1]
-    train_df, val_df, test_df = cold_target_split(
-        df,
-        seq_id_threshold=cfg.seq_id_threshold,
-        val_frac=cfg.val_frac,
-        test_frac=cfg.test_frac,
-        seed=cfg.seed,
-        cache_dir=cfg.data_dir,
-    )
+    # Split
+    if cfg.split_method == "random":
+        log.info("Using random 80/10/10 split ...")
+        train_df, val_df, test_df = random_split(df, seed=cfg.seed)
+    else:
+        train_df, val_df, test_df = cold_target_split(
+            df,
+            seq_id_threshold=cfg.seq_id_threshold,
+            val_frac=cfg.val_frac,
+            test_frac=cfg.test_frac,
+            seed=cfg.seed,
+            cache_dir=cfg.data_dir,
+        )
 
     # Tokenizers
     log.info("Loading tokenizers ...")
     mol_tok  = AutoTokenizer.from_pretrained(cfg.mol_model,  cache_dir=cfg.cache_dir)
-    prot_tok = AutoTokenizer.from_pretrained(cfg.prot_model, cache_dir=cfg.cache_dir)
+    prot_tok = AutoTokenizer.from_pretrained(cfg.esm_model,  cache_dir=cfg.cache_dir)
 
     # DataLoaders  [CRIT-2: dti_collate_fn for dynamic protein padding]
     def make_ldr(df_: pd.DataFrame, shuffle: bool) -> DataLoader:
@@ -1577,7 +1625,7 @@ def main() -> None:
     # Model
     model = CrossModalDTI(
         mol_model_name  = cfg.mol_model,
-        prot_model_name = cfg.prot_model,
+        prot_model_name = cfg.esm_model,
         d_model         = cfg.d_model,
         n_heads         = cfg.n_heads,
         n_cross_layers  = cfg.n_cross_layers,
