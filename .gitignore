@@ -8,6 +8,9 @@ checkpoint.pt
 *.pt
 *.pth
 
+# Claude Code prompt files
+CLAUDE_CODE_PROMPT.md
+
 # Ignore tool-specific metadata
 .claude/
 .claude.json
