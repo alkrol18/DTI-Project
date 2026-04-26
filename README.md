@@ -105,7 +105,7 @@ where `custom_binding_sites.json` maps `md5(sequence)[:16]` → list of 0-indexe
 
 ## Individual Contributions
 
-Solo project. All design, implementation, training, evaluation, and writing by Alex Krol. No teammates. Tooling acknowledgements are in [`ATTRIBUTION.md`](ATTRIBUTION.md).
+All design, implementation, training, evaluation, and writing by Alex Krol. Tooling acknowledgements are in [`ATTRIBUTION.md`](ATTRIBUTION.md).
 
 ## Requirements
 
