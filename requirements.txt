@@ -7,6 +7,12 @@ pandas>=2.0.0
 # Dataset
 PyTDC>=0.4.1
 
+# Levenshtein clustering fallback (used when MMseqs2 is unavailable)
+python-Levenshtein
+
+# Jupyter notebook support
+nbformat
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MMseqs2  (binary — NOT pip-installable)
 # ─────────────────────────────────────────────────────────────────────────────

@@ -16,3 +16,12 @@ history.jsonl
 stats-cache.json
 settings.json
 settings.local.json
+
+# LaTeX build artifacts
+*.aux
+*.log
+*.out
+*.toc
+*.fls
+*.fdb_latexmk
+*.synctex.gz
