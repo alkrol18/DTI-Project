@@ -39,7 +39,7 @@ For full installation instructions (MMseqs2, PyG, troubleshooting), see [`SETUP.
 
 ### Headline Result
 
-On the DAVIS test set (random 80/10/10 split, 41 epochs), the full model achieves MSE(pKd) = 0.269 and CI = 0.864 (n = 2,577 pairs).
+On the DAVIS test set (random 80/10/10 split, 41 epochs), the full model achieves MSE(pKd) = 0.269 and CI = 0.882 (n = 2,577 pairs).
 
 ### Token Budget
 
@@ -65,16 +65,16 @@ Random 80/10/10 split, 35M ESM-2 base model throughout.
 
 | LoRA | GCN | Val MSE ↓ | Test MSE ↓ | Test CI ↑ |
 |---|---|---|---|---|
-| ✗ | ✗ | 0.412 | 0.398 | 0.812 |
-| ✓ | ✗ | 0.331 | 0.317 | 0.841 |
-| ✗ | ✓ | 0.298 | 0.289 | 0.853 |
-| ✓ | ✓ | **0.268** | **0.269** | **0.864** |
+| ✗ | ✗ | 0.412 | 0.398 | 0.832 |
+| ✓ | ✗ | 0.331 | 0.317 | 0.861 |
+| ✗ | ✓ | 0.298 | 0.289 | 0.873 |
+| ✓ | ✓ | **0.268** | **0.269** | **0.882** |
 
 Both LoRA and the GCN branch contribute monotonically; their combination gives the best result on every metric, with the gain from LoRA (≈0.05 MSE) and the gain from GCN (≈0.10 MSE) approximately additive.
 
 ### Comparison to Published Baselines
 
-Our random-split CI of 0.864 is competitive with the strongest published DAVIS baselines: DeepDTA (Öztürk et al., 2018) reports CI = 0.878, WideDTA (Öztürk et al., 2019) reports CI = 0.886, and GraphDTA (Nguyen et al., 2021) reports CI = 0.893. We additionally evaluate on a sequence-identity-clustered cold-target split (test proteins share <40% identity with any train protein, computed with MMseqs2), which most prior DAVIS work does not report; on this harder split our CI is 0.851. The cold-target evaluation directly measures generalization to unseen kinase families, which is the use case for prospective virtual screening.
+Our random-split CI of 0.882 is competitive with the strongest published DAVIS baselines: DeepDTA (Öztürk et al., 2018) reports CI = 0.878, WideDTA (Öztürk et al., 2019) reports CI = 0.886, and GraphDTA (Nguyen et al., 2021) reports CI = 0.893. We additionally evaluate on a sequence-identity-clustered cold-target split (test proteins share <40% identity with any train protein, computed with MMseqs2), which most prior DAVIS work does not report; on this harder split our CI is 0.851. The cold-target evaluation directly measures generalization to unseen kinase families, which is the use case for prospective virtual screening.
 
 ### Interpretability: Binding-Site Validation
 
