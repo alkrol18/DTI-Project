@@ -57,7 +57,7 @@ Downloads are cached in the default Hugging Face cache directory (`~/.cache/hugg
 Run a single-epoch pass to verify the full pipeline (data loading, model forward pass, LoRA, GCN, evaluation):
 
 ```bash
-python dti_cross_modal.py --epochs 1 --batch_size 8
+python src/dti_cross_modal.py --epochs 1 --batch_size 8
 ```
 
 This should complete in approximately 3 minutes on a single GPU. Expected output: a non-NaN val MSE and CI printed at the end of epoch 1.
@@ -65,13 +65,13 @@ This should complete in approximately 3 minutes on a single GPU. Expected output
 ## Full Training Run
 
 ```bash
-python dti_cross_modal.py --epochs 41 --use_gcn --use_lora --esm_model facebook/esm2_t12_35M_UR50D
+python src/dti_cross_modal.py --epochs 41 --use_gcn --use_lora --esm_model facebook/esm2_t12_35M_UR50D
 ```
 
 Full training takes ~8 hours on an RTX 2080 Ti / A5000. On Duke DCC use the SLURM script:
 
 ```bash
-sbatch run_dti.sh
+sbatch src/run_dti.sh
 ```
 
 Pass `--resume` to continue from an existing checkpoint after preemption.
@@ -81,7 +81,7 @@ Pass `--resume` to continue from an existing checkpoint after preemption.
 **Out of GPU memory (OOM)**: Drop to the 8M ESM-2 variant:
 
 ```bash
-python dti_cross_modal.py --epochs 41 --use_gcn --use_lora --esm_model facebook/esm2_t6_8M_UR50D
+python src/dti_cross_modal.py --epochs 41 --use_gcn --use_lora --esm_model facebook/esm2_t6_8M_UR50D
 ```
 
 The 8M model uses ~3 GB and trains in ~3–4 hours on a single GPU.

@@ -10,11 +10,16 @@ This model predicts binding affinity (pKd) between a small-molecule drug (given 
 
 ```bash
 pip install -r requirements.txt
-python dti_cross_modal.py --epochs 41 --use_gcn --use_lora --esm_model facebook/esm2_t12_35M_UR50D
-python validate_binding_sites.py
+python src/dti_cross_modal.py --epochs 41 --use_gcn --use_lora --esm_model facebook/esm2_t12_35M_UR50D
+python src/validate_binding_sites.py
 ```
 
 For full installation instructions (MMseqs2, PyG, troubleshooting), see [`SETUP.md`](SETUP.md).
+
+## Video Links
+
+- **Demo video** (non-technical, 5 min): [`videos/Project Video.mp4`](videos/Project%20Video.mp4)
+- **Technical walkthrough** (code + ML choices, 10 min): [`videos/Technical Walkthrough.mp4`](videos/Technical%20Walkthrough.mp4)
 
 ## Architecture
 
@@ -81,7 +86,7 @@ Our random-split CI of 0.882 is competitive with the strongest published DAVIS b
 After training, the cross-attention weights are compared against known kinase binding-residue annotations:
 
 ```bash
-python validate_binding_sites.py --checkpoint ./outputs/best_model.pt --top_k 20
+python src/validate_binding_sites.py --checkpoint ./outputs/best_model.pt --top_k 20
 ```
 
 - **Precision@K**: fraction of the model's top-K attended residues that fall within the known binding pocket.
@@ -91,17 +96,12 @@ python validate_binding_sites.py --checkpoint ./outputs/best_model.pt --top_k 20
 
 Optionally supply custom PDB/BioLiP annotations:
 ```bash
-python validate_binding_sites.py \
+python src/validate_binding_sites.py \
     --checkpoint ./outputs/best_model.pt \
     --custom_annot ./custom_binding_sites.json \
     --top_k 20
 ```
 where `custom_binding_sites.json` maps `md5(sequence)[:16]` → list of 0-indexed binding residue positions.
-
-## Video Links
-
-- **Demo video** (non-technical, 5 min): _link to be added_
-- **Technical walkthrough** (code + ML choices, 10 min): _link to be added_
 
 ## Individual Contributions
 
@@ -118,17 +118,22 @@ See [`SETUP.md`](SETUP.md) for full instructions including MMseqs2, PyTorch Geom
 ## Repo Layout
 
 ```
-dti_cross_modal.py          # model, training loop, evaluation
-validate_binding_sites.py   # cross-attention binding-site validation
-run_dti.sh                  # SLURM job script (Duke DCC, A5000)
-requirements.txt
-SETUP.md                    # full install + troubleshooting guide
-ATTRIBUTION.md              # pretrained models, datasets, tools, AI assistance
+src/
+  dti_cross_modal.py        # model, training loop, evaluation
+  validate_binding_sites.py # cross-attention binding-site validation
+  run_dti.sh                # SLURM job script (Duke DCC, A5000)
 notebooks/
   error_analysis.ipynb      # residual scatter, outlier analysis, failure cases
+videos/                     # demo and technical walkthrough videos
+data/                       # DAVIS dataset cached here on first run
+models/                     # trained model checkpoints
+docs/                       # additional documentation
 evidence/
   logs/                     # training logs per run
   outputs/                  # final_metrics.json, cold_target_metrics.json, etc.
+requirements.txt
+SETUP.md                    # full install + troubleshooting guide
+ATTRIBUTION.md              # pretrained models, datasets, tools, AI assistance
 ```
 
 ## Design Notes
